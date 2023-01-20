@@ -86,29 +86,44 @@ class SOM(object):
             eivalues = PCA(4).fit_transform(data.T).T
             for i in range(4):
                 self.map[np.random.randint(0, self.x), np.random.randint(0, self.y)] = eivalues[i]
-
         self.inizialized = True
 
-    def winner(self, vector: np.ndarray) -> np.ndarray:
-        """Compute the winner neuron closest to the vector (Euclidean distance)
+    def winner(self, vector: np.ndarray, unc_vector: np.ndarray = []) -> np.ndarray:
+        # 18 January Sotiria
+        # Add option for chi2 distance to calculate the winning neuron, more appropriate for data with uncertainty measurements
+        """Compute the winner neuron closest to the vector (Euclidean or chi2 distance)
 
         :param vector: vector of current data point(s)
         :type vector: np.ndarray
+        :param distance: Euclidean or chi2 distance
+        :type distance: str
+        :param sigma: vector of uncertainties of data point(s)
+        :type sigma: np.ndarray
         :return: indices of winning neuron
         :rtype: np.ndarray
         """
-        indx = np.argmin(np.sum((self.map - vector) ** 2, axis=2))
+
+        # Default use uncertainties. If unc_vector not supplied, assume ones which falls back to original implementation.
+
+        if unc_vector == []:
+            unc_vector = np.ones_like(vector)
+
+        indx = np.argmin(np.sum(((self.map - vector)/unc_vector) ** 2, axis=2))
+        
         return np.array([indx // self.y, indx % self.y])
 
-    def cycle(self, vector: np.ndarray, verbose: bool = True):
+    def cycle(self, vector: np.ndarray, unc_vector: np.ndarray, verbose: bool = True):
         """Perform one iteration in adapting the SOM towards a chosen data point
 
         :param vector: current data point
         :type vector: np.ndarray
+        :param unc_vector: current data point uncertainties
+        :type unc_vector: np.ndarray
         :param verbose: verbosity control
         :type verbose: bool
         """
-        w = self.winner(vector)
+
+        w = self.winner(vector, unc_vector)
         # get Manhattan distance (with PBC) of every neuron in the map to the winner
         dists = man_dist_pbc(self.indxmap, w, self.shape)
         # smooth the distances with the current sigma
@@ -126,6 +141,7 @@ class SOM(object):
     def fit(
         self,
         data: np.ndarray,
+        unc_data: np.ndarray,
         epochs: int = 0,
         save_e: bool = False,
         interval: int = 1000,
@@ -136,6 +152,8 @@ class SOM(object):
 
         :param data: data to train on
         :type data: np.ndarray
+        :param sigma: data uncertainties, used as weight for chi2 distance. Not used in Euclidean distance.
+        :type sigma: np.ndarray 
         :param epochs: number of iterations to train; if 0, epochs=len(data) and every data point is used once
         :type epochs: int, optional
         :param save_e: whether to save the error history
@@ -168,13 +186,13 @@ class SOM(object):
 
         if save_e:  # save the error to history every "interval" epochs
             for i in range(epochs):
-                self.cycle(data[indx[i]], verbose=verbose)
+                self.cycle(data[indx[i]], unc_data[indx[i]], verbose=verbose)
                 if i % interval == 0:
                     self.history.append(self.som_error(data))
             self.error = self.som_error(data)
         else:
             for i in range(epochs):
-                self.cycle(data[indx[i]], verbose=verbose)
+                self.cycle(data[indx[i]], unc_data[indx[i]], verbose=verbose)
 
     def transform(self, data: np.ndarray) -> np.ndarray:
         """Transform data in to the SOM space
@@ -203,7 +221,7 @@ class SOM(object):
                 dists[x, y] = np.mean(d)
         self.distmap = dists / dists.max()
 
-    def winner_map(self, data: np.ndarray) -> np.ndarray:
+    def winner_map(self, data: np.ndarray, unc_data: np.ndarray = []) -> np.ndarray:
         """Get the number of times, a certain neuron in the trained SOM is the winner for the given data.
 
         :param data: data to compute the winner neurons on
@@ -211,13 +229,16 @@ class SOM(object):
         :return: map with winner counts at corresponding neuron location
         :rtype: np.ndarray
         """
+        if unc_data == []:
+            unc_data = np.ones_like(data)
+
         wm = np.zeros(self.shape, dtype=int)
-        for d in data:
-            [x, y] = self.winner(d)
+        for d,c in zip(data, unc_data):
+            [x, y] = self.winner(d, c)
             wm[x, y] += 1
         return wm
 
-    def _one_winner_neuron(self, data: np.ndarray, q: Queue):
+    def _one_winner_neuron(self, data: np.ndarray, q: Queue,  unc_data: np.ndarray=[]):
         """Private function to be used for parallel winner neuron computation
 
         :param data: data matrix to compute the winner neurons on
@@ -226,9 +247,11 @@ class SOM(object):
         :type q: multiprocessing.Queue
         :return: winner neuron cooridnates for every datapoint (see :py:method:`SOM.winner_neurons`)
         """
-        q.put(np.array([self.winner(d) for d in data], dtype="int"))
+        if unc_data == []:
+            unc_data = np.ones_like(data)
+        q.put(np.array([self.winner(d, c) for d,c in zip(data, unc_data)], dtype="int"))
 
-    def winner_neurons(self, data: np.ndarray) -> np.ndarray:
+    def winner_neurons(self, data: np.ndarray, unc_data: np.ndarray=[]) -> np.ndarray:
         """For every datapoint, get the winner neuron coordinates.
 
         :param data: data to compute the winner neurons on
@@ -237,24 +260,38 @@ class SOM(object):
         :rtype: np.ndarray
         """
         print("Calculating neuron indices for all data points...")
+
+
+        if unc_data == []:
+            unc_data = np.ones_like(data)
+
+
         queue = Queue()
-        n = cpu_count() - 1
-        for d in np.array_split(np.array(data), n):
+
+        njobs = cpu_count()-1
+
+        if njobs > len(data): njobs=1
+
+        Dat = np.array_split(np.array(data), njobs)
+        unc_Dat = np.array_split(np.array(unc_data), njobs)
+
+        for d,c in zip(Dat, unc_Dat):
             p = Process(
                 target=self._one_winner_neuron,
                 args=(
                     d,
                     queue,
+                    c
                 ),
             )
             p.start()
         rslt = []
-        for _ in range(n):
-            rslt.extend(queue.get(timeout=10))
+        for _ in range(njobs):
+            rslt.extend(queue.get(timeout=100))
         self.winner_indices = np.array(rslt, dtype="int").reshape((len(data), 2))
         return self.winner_indices
 
-    def _one_error(self, data: np.ndarray, q: Queue):
+    def _one_error(self, data: np.ndarray, unc_data: np.ndarray=[], q: Queue=()):
         """Private function to be used for parallel error calculation
 
         :param data: data matrix to calculate SOM error for
@@ -264,13 +301,13 @@ class SOM(object):
         :return: list of SOM errors (see :py:method:`SOM.som_error`)
         """
         errs = []
-        for d in data:
-            [x, y] = self.winner(d)
+        for d,c in zip(data, unc_data):
+            [x, y] = self.winner(d,c)
             dist = self.map[x, y] - d
             errs.append(np.sqrt(dist.dot(dist.T)))
         q.put(errs)
 
-    def som_error(self, data: np.ndarray) -> float:
+    def som_error(self, data: np.ndarray, unc_data: np.ndarray=[]) -> float:
         """Calculates the overall error as the average difference between the winning neurons and the data points
 
         :param data: data to calculate the overall error for
@@ -278,18 +315,28 @@ class SOM(object):
         :return: normalized error
         :rtype: float
         """
+        if unc_data == []:
+            unc_data = np.ones_like(data)
+
+        njobs = cpu_count()-1
+
+        if njobs > len(data): njobs=1
+
         queue = Queue()
-        for d in np.array_split(np.array(data), cpu_count()):
+        Dat = np.array_split(np.array(data), njobs)
+        unc_Dat = np.array_split(np.array(unc_data), njobs)
+
+        for d,c in zip(Dat, unc_Dat):
             p = Process(
                 target=self._one_error,
                 args=(
-                    d,
+                    d,c,
                     queue,
                 ),
             )
             p.start()
         rslt = []
-        for _ in range(cpu_count()):
+        for _ in range(njobs):
             rslt.extend(queue.get(timeout=50))
         return float(sum(rslt) / float(len(data)))
 
